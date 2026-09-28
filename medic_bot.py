@@ -16,7 +16,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-# Portal notifications + in-game org + Discord-authoritative rank sync: v3.5
+# Portal notifications + Discord-authoritative rank sync + payout tools: v3.9.1
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1439473833273856120  # text channel if needed
@@ -217,16 +217,20 @@ def set_bank_ryo(year: int, month: int, amount: int):
     return _save_month_payout_config(year, month, pool=amount)
 
 
-def set_medic_payout_eligibility(year: int, month: int, discord_id, eligible: bool):
-    did = clean_sheet_id(discord_id)
-    if not did:
-        raise ValueError("A valid Discord ID is required.")
+def set_medic_payout_eligibility(year: int, month: int, payout_identity, eligible: bool):
+    """
+    Store monthly payout eligibility using a stable Discord ID when available.
+    Legacy/unlinked former Medics can fall back to a name:<normalized-name> key.
+    """
+    identity = clean_sheet_id(payout_identity)
+    if not identity:
+        raise ValueError("A valid payout identity is required.")
 
     opted_out = get_payout_optouts(year, month)
     if eligible:
-        opted_out.discard(did)
+        opted_out.discard(identity)
     else:
-        opted_out.add(did)
+        opted_out.add(identity)
 
     return _save_month_payout_config(year, month, opted_out=opted_out)
 
@@ -545,6 +549,72 @@ def linked_medic_for_discord_id(discord_id: int):
     return None
 
 
+def payout_medic_rows():
+    """Return Master Log Medic rows for payout selection, including former Discord members."""
+    try:
+        master = SS.worksheet("Leaf Master Medical Log")
+        return get_master_records_cached(master, force=True)
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+
+
+def find_payout_medic_by_name(medic_name: str):
+    """
+    Find a Medic from the Master Medical Log by name.
+
+    Exact case-insensitive matches win. A unique partial match is accepted so
+    admins can still type names manually if Discord autocomplete is unavailable.
+    """
+    query = str(medic_name or "").strip()
+    if not query:
+        return None
+
+    rows = payout_medic_rows()
+    exact = []
+    partial = []
+
+    for row in rows:
+        name = str(row.get("Medic", "") or "").strip()
+        if not name:
+            continue
+        if name.lower() == query.lower():
+            exact.append(row)
+        elif query.lower() in name.lower():
+            partial.append(row)
+
+    if exact:
+        return exact[0]
+    if len(partial) == 1:
+        return partial[0]
+    return None
+
+
+def payout_identity_for_medic_row(row: dict) -> str:
+    """
+    Prefer the Medic's stored Discord ID even if they have left the server.
+    If an old Master Log row has no Discord ID, fall back to a normalized name.
+    """
+    did = clean_sheet_id(row.get("Discord ID", ""))
+    if did:
+        return did
+
+    medic_name = str(row.get("Medic", "") or "").strip().lower()
+    if medic_name:
+        return f"name:{medic_name}"
+    return ""
+
+
+def payout_identity_is_opted_out(identity_key: str, medic_name: str, opted_out_values) -> bool:
+    """Check both modern Discord-ID opt-outs and legacy name fallback opt-outs."""
+    opted_out_values = set(opted_out_values or [])
+    did = _identity_discord_id(identity_key)
+    if did and did in opted_out_values:
+        return True
+
+    name_key = f"name:{str(medic_name or '').strip().lower()}"
+    return bool(name_key != "name:" and name_key in opted_out_values)
+
+
 def _identity_discord_id(identity_key: str) -> str:
     """Extract a Discord ID from an id:123 identity key."""
     if str(identity_key).startswith("id:"):
@@ -575,8 +645,8 @@ def calculate_monthly_payout_snapshot(year: int, month: int) -> dict:
 
     eligible_adjusted_total = 0.0
     for key, adj in adjusted.items():
-        did = _identity_discord_id(key)
-        if did and did in opted_out_ids:
+        medic = report_display.get(key) or master_display.get(key) or key
+        if payout_identity_is_opted_out(key, medic, opted_out_ids):
             continue
         eligible_adjusted_total += adj
 
@@ -584,7 +654,7 @@ def calculate_monthly_payout_snapshot(year: int, month: int) -> dict:
     for key in sorted(adjusted, key=adjusted.get, reverse=True):
         medic = report_display.get(key) or master_display.get(key) or key
         did = _identity_discord_id(key)
-        opted_out = bool(did and did in opted_out_ids)
+        opted_out = payout_identity_is_opted_out(key, medic, opted_out_ids)
         adj = adjusted[key]
 
         if opted_out:
@@ -801,8 +871,13 @@ def update_leaderboard():
 
     opted_out_ids = get_payout_optouts(current_year, current_month)
     eligible_adjusted = sum(
-        adj for key, adj in adjusted_points.items()
-        if _identity_discord_id(key) not in opted_out_ids
+        adj
+        for key, adj in adjusted_points.items()
+        if not payout_identity_is_opted_out(
+            key,
+            report_display.get(key) or master_display.get(key) or key,
+            opted_out_ids,
+        )
     )
 
     sorted_keys = sorted(adjusted_points, key=adjusted_points.get, reverse=True)
@@ -819,7 +894,7 @@ def update_leaderboard():
         adj = adjusted_points[key]
 
         did = _identity_discord_id(key)
-        opted_out = bool(did and did in opted_out_ids)
+        opted_out = payout_identity_is_opted_out(key, medic, opted_out_ids)
         if opted_out:
             pay = "Opted Out"
         else:
@@ -870,8 +945,13 @@ def update_single_leaderboard(year: int, month: int):
 
     opted_out_ids = get_payout_optouts(year, month)
     eligible_adj = sum(
-        adj for key, adj in adjusted.items()
-        if _identity_discord_id(key) not in opted_out_ids
+        adj
+        for key, adj in adjusted.items()
+        if not payout_identity_is_opted_out(
+            key,
+            report_display.get(key) or master_display.get(key) or key,
+            opted_out_ids,
+        )
     )
 
     output = [LEADERBOARD_HEADERS]
@@ -886,7 +966,7 @@ def update_single_leaderboard(year: int, month: int):
         adj_pts = adjusted[key]
 
         did = _identity_discord_id(key)
-        opted_out = bool(did and did in opted_out_ids)
+        opted_out = payout_identity_is_opted_out(key, medic, opted_out_ids)
         if opted_out:
             pay = "Opted Out"
         else:
@@ -1964,7 +2044,7 @@ tree = discord.app_commands.CommandTree(bot)
 
 # ================= COMMANDS =================
 # Command interface consolidated in MedBot v3.7.
-# Monthly payout opt-out/redistribution added in MedBot v3.9. Previous-month website stats added in v3.8.
+# Monthly payout opt-out/redistribution added in v3.9; former-Medic payout selection added in v3.9.1. Previous-month website stats added in v3.8.
 @tree.command(
     name="setrank",
     description="Ranks are controlled by Discord roles"
@@ -2885,13 +2965,13 @@ async def medadmin_sync(
 
 @payout_group.command(name="optout", description="Exclude a Medic from pay for one month")
 @discord.app_commands.describe(
-    medic="Medic who declined payment",
+    medic="Medic name from the Master Log (works even if they left Discord)",
     year="Year, e.g. 2026",
     month="Month number, 1-12",
 )
 async def medadmin_payout_optout(
     interaction: discord.Interaction,
-    medic: discord.Member,
+    medic: str,
     year: int,
     month: int,
 ):
@@ -2905,41 +2985,79 @@ async def medadmin_payout_optout(
         await interaction.followup.send("❌ Month must be 1–12.")
         return
 
-    linked = await asyncio.to_thread(linked_medic_for_discord_id, medic.id)
+    linked = await asyncio.to_thread(find_payout_medic_by_name, medic)
     if not linked:
         await interaction.followup.send(
-            f"⚠️ {medic.mention} is not linked to a Medic in the Master Medical Log. "
-            "Use `/medadmin link` first."
+            f"⚠️ I could not uniquely match **{medic}** in the Master Medical Log. "
+            "Choose a name from autocomplete or type the full Medic name."
+        )
+        return
+
+    medic_name = str(linked.get("Medic", "") or medic).strip()
+    payout_identity = payout_identity_for_medic_row(linked)
+    if not payout_identity:
+        await interaction.followup.send(
+            f"⚠️ **{medic_name}** has no usable payout identity in the Master Medical Log."
         )
         return
 
     await asyncio.to_thread(
-        set_medic_payout_eligibility, year, month, medic.id, False
+        set_medic_payout_eligibility, year, month, payout_identity, False
     )
     await asyncio.to_thread(get_raw_records_cached, True)
     await asyncio.to_thread(update_single_leaderboard, year, month)
 
     snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
     month_name = datetime(year, month, 1).strftime("%B")
-    medic_name = str(linked.get("Medic", "") or member_display_name(medic))
+    identity_note = (
+        "stored Discord ID"
+        if not str(payout_identity).startswith("name:")
+        else "Master Log name"
+    )
 
     await interaction.followup.send(
         f"✅ **{medic_name}** opted out of the **{month_name} {year}** payout.\n"
         "Their reports, BP, jobs, leaderboard position, and rank progress are unchanged.\n"
+        f"Identity used: **{identity_note}** — they do not need to still be in Discord.\n"
         f"💰 **{snapshot['pool']:,} Ryo** is now redistributed across "
         f"**{snapshot['eligible_count']} eligible Medic(s)**."
     )
 
 
+@medadmin_payout_optout.autocomplete("medic")
+async def payout_optout_medic_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    rows = await asyncio.to_thread(payout_medic_rows)
+    query = str(current or "").strip().lower()
+
+    names = []
+    for row in rows:
+        name = str(row.get("Medic", "") or "").strip()
+        if not name:
+            continue
+        if query and query not in name.lower():
+            continue
+        if name not in names:
+            names.append(name)
+
+    names.sort(key=str.lower)
+    return [
+        discord.app_commands.Choice(name=name[:100], value=name[:100])
+        for name in names[:25]
+    ]
+
+
 @payout_group.command(name="optin", description="Restore a Medic's pay eligibility for one month")
 @discord.app_commands.describe(
-    medic="Medic to restore to the payout",
+    medic="Medic name from the Master Log (works even if they left Discord)",
     year="Year, e.g. 2026",
     month="Month number, 1-12",
 )
 async def medadmin_payout_optin(
     interaction: discord.Interaction,
-    medic: discord.Member,
+    medic: str,
     year: int,
     month: int,
 ):
@@ -2953,28 +3071,61 @@ async def medadmin_payout_optin(
         await interaction.followup.send("❌ Month must be 1–12.")
         return
 
-    linked = await asyncio.to_thread(linked_medic_for_discord_id, medic.id)
+    linked = await asyncio.to_thread(find_payout_medic_by_name, medic)
     if not linked:
         await interaction.followup.send(
-            f"⚠️ {medic.mention} is not linked to a Medic in the Master Medical Log."
+            f"⚠️ I could not uniquely match **{medic}** in the Master Medical Log. "
+            "Choose a name from autocomplete or type the full Medic name."
+        )
+        return
+
+    medic_name = str(linked.get("Medic", "") or medic).strip()
+    payout_identity = payout_identity_for_medic_row(linked)
+    if not payout_identity:
+        await interaction.followup.send(
+            f"⚠️ **{medic_name}** has no usable payout identity in the Master Medical Log."
         )
         return
 
     await asyncio.to_thread(
-        set_medic_payout_eligibility, year, month, medic.id, True
+        set_medic_payout_eligibility, year, month, payout_identity, True
     )
     await asyncio.to_thread(get_raw_records_cached, True)
     await asyncio.to_thread(update_single_leaderboard, year, month)
 
     snapshot = await asyncio.to_thread(calculate_monthly_payout_snapshot, year, month)
     month_name = datetime(year, month, 1).strftime("%B")
-    medic_name = str(linked.get("Medic", "") or member_display_name(medic))
 
     await interaction.followup.send(
         f"✅ **{medic_name}** is eligible again for the **{month_name} {year}** payout.\n"
         f"💰 The **{snapshot['pool']:,} Ryo** pool has been recalculated across "
         f"**{snapshot['eligible_count']} eligible Medic(s)**."
     )
+
+
+@medadmin_payout_optin.autocomplete("medic")
+async def payout_optin_medic_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    rows = await asyncio.to_thread(payout_medic_rows)
+    query = str(current or "").strip().lower()
+
+    names = []
+    for row in rows:
+        name = str(row.get("Medic", "") or "").strip()
+        if not name:
+            continue
+        if query and query not in name.lower():
+            continue
+        if name not in names:
+            names.append(name)
+
+    names.sort(key=str.lower)
+    return [
+        discord.app_commands.Choice(name=name[:100], value=name[:100])
+        for name in names[:25]
+    ]
 
 
 @payout_group.command(name="status", description="Show payout eligibility and distribution for one month")
